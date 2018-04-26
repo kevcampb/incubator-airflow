@@ -54,6 +54,7 @@ from urllib.parse import urlunparse
 import airflow
 from airflow import api
 from airflow import jobs, settings
+from airflow.scheduler import Scheduler 
 from airflow import configuration as conf
 from airflow.exceptions import AirflowException, AirflowWebServerTimeout
 from airflow.executors import GetDefaultExecutor
@@ -854,6 +855,46 @@ def webserver(args):
             signal.signal(signal.SIGTERM, kill_proc)
 
             monitor_gunicorn(gunicorn_master_proc)
+
+def new_scheduler(args):
+    print(settings.HEADER)
+
+    scheduler = None
+
+    def kill_proc(dummy_signum, dummy_frame):
+        scheduler.shutdown()
+
+    if args.daemon:
+        pid, stdout, stderr, log_file = setup_locations("new_scheduler", args.pid, args.stdout, args.stderr, args.log_file)
+        handle = setup_logging(log_file)
+        stdout = open(stdout, 'w+')
+        stderr = open(stderr, 'w+')
+
+
+        ctx = daemon.DaemonContext(
+            pidfile=TimeoutPIDLockFile(pid, -1),
+            files_preserve=[handle],
+            stdout=stdout,
+            stderr=stderr,
+           # signal_map={
+           #     signal.SIGINT: kill_proc,
+           #     signal.SIGTERM: kill_proc
+           # },
+        )
+        with ctx:
+            scheduler = Scheduler()
+
+        stdout.close()
+        stderr.close()
+    else:
+        #signal.signal(signal.SIGINT, kill_proc)
+        #signal.signal(signal.SIGTERM, kill_proc)
+        #signal.signal(signal.SIGQUIT, kill_proc)
+        signal.signal(signal.SIGINT, sigint_handler)
+        signal.signal(signal.SIGTERM, sigint_handler)
+        signal.signal(signal.SIGQUIT, sigquit_handler)
+        scheduler = Scheduler()
+        scheduler.run()
 
 
 @cli_utils.action_logging
@@ -1736,6 +1777,12 @@ class CLIFactory(object):
             'help': "Start a scheduler instance",
             'args': ('dag_id_opt', 'subdir', 'run_duration', 'num_runs',
                      'do_pickle', 'pid', 'daemon', 'stdout', 'stderr',
+                     'log_file'),
+        }, {
+            'func': new_scheduler,
+            'help': "Start a new_scheduler instance",
+            'args': (
+                     'pid', 'daemon', 'stdout', 'stderr',
                      'log_file'),
         }, {
             'func': worker,

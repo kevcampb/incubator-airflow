@@ -3267,6 +3267,112 @@ class DAG(BaseDag, LoggingMixin):
 
         return run_dates
 
+    @provide_session
+    def get_next_run_date(self, session=None, last_scheduled_run=None):
+        """ Get the next run date for this dag
+
+            Last scheduled run can be supplied, if known, to avoid a database query
+
+            Returns None in any of the following scenarios:
+
+              * Dag is set to run @once, and it has already run
+              * Dag has catchup disabled
+              * The next run date is due in the future
+        
+            TODO: This still needs checked more thoroughly. Was just grabbed from the jobs.py code
+              and the db query to check backfills removed - do we need it? 
+        """
+
+        if last_scheduled_run is None:
+            # this query should be replaced by find dagrun
+            qry = (
+                session.query(func.max(DagRun.execution_date))
+                .filter_by(dag_id=self.dag_id)
+                .filter(or_(
+                    DagRun.external_trigger == False,
+                    # add % as a wildcard for the like query
+                    DagRun.run_id.like(DagRun.ID_PREFIX + '%')
+                ))
+            )
+            last_scheduled_run = qry.scalar()
+
+        # print ("Last Scheduled run", last_scheduled_run)
+
+        # don't schedule @once again
+        if self.schedule_interval == '@once' and last_scheduled_run:
+            return None
+
+        # don't do scheduler catchup for dag's that don't have dag.catchup = True
+        if not self.catchup:
+            # The logic is that we move start_date up until
+            # one period before, so that datetime.utcnow() is AFTER
+            # the period end, and the job can be created...
+            now = datetime.utcnow()
+            next_start = self.following_schedule(now)
+            last_start = self.previous_schedule(now)
+            if next_start <= now:
+                new_start = last_start
+            else:
+                new_start = self.previous_schedule(last_start)
+
+            if self.start_date:
+                if new_start >= self.start_date:
+                    self.start_date = new_start
+            else:
+                self.start_date = new_start
+
+        next_run_date = None
+        if not last_scheduled_run:
+            # First run
+            task_start_dates = [t.start_date for t in self.tasks]
+            if task_start_dates:
+                next_run_date = self.normalize_schedule(min(task_start_dates))
+                self.log.debug(
+                    "Next run date based on tasks %s",
+                    next_run_date
+                )
+        else:
+            next_run_date = self.following_schedule(last_scheduled_run)
+
+        # don't ever schedule prior to the dag's start_date
+        if self.start_date:
+            next_run_date = (self.start_date if not next_run_date
+                             else max(next_run_date, self.start_date))
+            if next_run_date == self.start_date:
+                next_run_date = self.normalize_schedule(self.start_date)
+
+            self.log.debug(
+                "Dag start date: %s. Next run date: %s",
+                self.start_date, next_run_date
+            )
+
+        # don't ever schedule in the future
+        if next_run_date > timezone.utcnow():
+            return
+
+        # this structure is necessary to avoid a TypeError from concatenating
+        # NoneType
+        if self.schedule_interval == '@once':
+            period_end = next_run_date
+        elif next_run_date:
+            period_end = self.following_schedule(next_run_date)
+
+        # Don't schedule a dag beyond its end_date (as specified by the dag param)
+        if next_run_date and self.end_date and next_run_date > self.end_date:
+            return
+
+        # Don't schedule a dag beyond its end_date (as specified by the task params)
+        # Get the min task end date, which may come from the self.default_args
+        min_task_end_date = []
+        task_end_dates = [t.end_date for t in self.tasks if t.end_date]
+        if task_end_dates:
+            min_task_end_date = min(task_end_dates)
+        if next_run_date and min_task_end_date and next_run_date > min_task_end_date:
+            return
+    
+        if next_run_date and period_end and period_end <= timezone.utcnow():
+            return next_run_date
+
     def normalize_schedule(self, dttm):
         """
         Returns dttm + interval unless dttm is first interval then it returns dttm
