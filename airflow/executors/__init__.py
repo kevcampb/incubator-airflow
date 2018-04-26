@@ -22,6 +22,7 @@ from airflow import configuration
 from airflow.exceptions import AirflowException
 from airflow.executors.base_executor import BaseExecutor
 from airflow.executors.local_executor import LocalExecutor
+from airflow.executors.dummy_executor import DummyExecutor
 from airflow.executors.sequential_executor import SequentialExecutor
 
 DEFAULT_EXECUTOR = None
@@ -52,6 +53,7 @@ def GetDefaultExecutor():
 
 class Executors:
     LocalExecutor = "LocalExecutor"
+    DummyExecutor = "DummyExecutor"
     SequentialExecutor = "SequentialExecutor"
     CeleryExecutor = "CeleryExecutor"
     DaskExecutor = "DaskExecutor"
@@ -67,6 +69,8 @@ def _get_executor(executor_name):
     """
     if executor_name == Executors.LocalExecutor:
         return LocalExecutor()
+    elif executor_name == Executors.DummyExecutor:
+        return DummyExecutor()
     elif executor_name == Executors.SequentialExecutor:
         return SequentialExecutor()
     elif executor_name == Executors.CeleryExecutor:
