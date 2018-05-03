@@ -11,6 +11,7 @@ from collections import defaultdict
 from airflow import models
 from airflow.utils.log.logging_mixin import LoggingMixin
 from airflow.utils.state import State
+from airflow.utils.helpers import chunks
 from airflow.utils import timezone
 from airflow import executors, settings
 
@@ -18,11 +19,11 @@ from sqlalchemy.orm import aliased, make_transient
 from sqlalchemy.sql.expression import func
 from sqlalchemy import and_, or_, tuple_
 
-TASK_LIMIT = 200
+TASK_LIMIT = 36824
 
 class Scheduler(LoggingMixin):
 
-    MAX_CREATE_DAGRUN_PER_LOOP = 1000
+    MAX_CREATE_DAGRUN_PER_LOOP = 512
 
     def __init__(self, executor=executors.GetDefaultExecutor()):
 
@@ -30,8 +31,15 @@ class Scheduler(LoggingMixin):
 
         self.dagbag = None
         self.dags = {}
-        self.active_tasks = set()
         self.executor = executor
+
+        # State counts
+    
+        self.active_tasks = set()
+        # We keep a count of the tasks which pass depdendency checks for now
+        # to avoid making too many tasks at once
+        self.ready_tasks = set()
+        self.ready_count = 0
 
         self._shutdown = False
 
@@ -43,7 +51,7 @@ class Scheduler(LoggingMixin):
         # will not have completed. There's a few edge cases around here, and it's more complicated
         # when using CeleryExecutor, as those tasks may be currently in progress. For now we're 
         # assuming that tasks are idempotent and well written so that this wouldn't be a problem.
-        self.reset_active_tasks(session)
+        self.reset_scheduler(session)
 
         session.commit()
         session.expire_all()
@@ -68,28 +76,38 @@ class Scheduler(LoggingMixin):
             # If any task is in state running but has exceeded timeout, set state to failed
             self.fail_timed_out_tasks(session)
 
-            # Check to see if we need to create new DagRuns and TaskInstances for Dags which run
-            # on a schedule
-            self.build_dagruns_and_tasks(session)
-                
             # Run dependency checks. At present this returns back a list of tasks_to_run. As a 
             # side effect updates task state to SKIPPED / UPSTREAM_FAILED
             tasks_to_run = self.run_dependency_checks(session)
-            
+
+            # Store the counts
+            self.ready_tasks = set(
+                [(ti.dag_id, ti.task_id, ti.execution_date) for ti in tasks_to_run]
+            )
+
+            self.ready_count = len(tasks_to_run) + len(self.active_tasks)
+
             # Enqueue tasks to workers, respecting concurrency limits and task dependencies
             self.queue_tasks_to_workers(session, tasks_to_run)
 
+            # Check to see if we need to create new DagRuns and TaskInstances for Dags which run
+            # on a schedule. We do this after the dependency checks so we know how many tasks
+            # are ready to run
+            self.build_dagruns_and_tasks(session)
+            
             # Check SLAs and alert if any tasks haven't been completed on time
             self.perform_sla_check(session)
 
+            # Now run the executor. Some executors will update state in the DB
             self.log.info("Heartbeating executor")
             self.executor.heartbeat()
 
             # Flush all state to the database. This will clear any cached database objects, so the 
             # next iteration reloads from the database.
             session.commit()
-
-            time.sleep(0.5)
+    
+            self.log.info("Scheduler loop complete")
+            # time.sleep(0.5)
 
         self.log.info("Shutting down executor")
         # Wait for executor to exit and shutdown cleanly
@@ -133,17 +151,34 @@ class Scheduler(LoggingMixin):
         for dag_id in self.dagbag.dags:
             self.dags[dag_id] = self.dagbag.get_dag(dag_id)
 
-    def reset_active_tasks(self, session):
-        """ reset the database state 
+    def reset_scheduler(self, session):
+        """ Reset the database state when the scheduler is restarted
         
-            Note: It's possible some tasks are still active in an worker even though the scheduler
-            has restarted. In this scenario, hmmm... annoying
+            Tasks which are in the queued state need to basck to None as the executor queue will now have
+            been reset. Those tasks will get their dependencies checked again, and re-raised as expected
         """
 
-        tis = session.query(models.TaskInstance).filter(
-            or_(models.TaskInstance.state==State.RUNNING, models.TaskInstance.state==State.QUEUED)
+        LOCAL_EXECUTORS = (
+            executors.LocalExecutor, 
+#            executors.Executors.DummyExecutor, 
+            executors.SequentialExecutor
         )
+
+        tis = (session.query(models.TaskInstance)
+                .filter(models.TaskInstance.state==State.QUEUED)
+                )
         tis.update({'state': State.NONE})
+
+        tis = (session.query(models.TaskInstance)
+                .filter(models.TaskInstance.state==State.RUNNING)
+                )
+    
+        if isinstance(self.executor, LOCAL_EXECUTORS):
+            tis.update({'state': State.NONE})
+        else:
+            if tis.count() > 0:
+                self.log.warn("Tasks are currently in the RUNNING state and you are running a distributed executor. You need to wait for these tasks to time out")
+                time.sleep(2)
 
         # DagRun state is a derived state from whether all tasks are active or not
         #   All task instances are in state SUCCESS -> DagRun is in state SUCCESS
@@ -237,7 +272,7 @@ class Scheduler(LoggingMixin):
             queue = ti.queue
 
             self.log.info(
-                "Sending {} {} {} to executor with priority {} and queue {}".format(ti.dag_id, ti.task_id, ti.execution_date, priority, queue)
+                "Sending {} {} {} to executor with priority {} and queue {}, current state is {}".format(ti.dag_id, ti.task_id, ti.execution_date, priority, queue, ti.state)
             )
 
             ti.state = State.QUEUED
@@ -278,165 +313,174 @@ class Scheduler(LoggingMixin):
 
     def run_dependency_checks(self, session):
 
+        st_tot = time.time()
+
         # Find the task instances we want to run depdency checks for. 
+        # We retain this a subquery as we will pass it to the inner methods which pull in the 
+        # additional data for each task instance, on order to carry out dependencies
 
-        # We retieve the task keys from the database and retain them for the next stages. It's possble
-        # that this could be avoided, and the depdency information and task instances are retrieved in 
-        # a single select using some fairly complex subqueries. 
-        
-        # Note if you are doing this entirely in the database, you would need to use a single select 
-        # statement or set isolation level and deal with phantom reads / non-repeatable reads, as other
-        # parts of the codebase make changes to the TaskInstance table
-
-        # For now just doing this by reading and storing the keys. Subqueries etc would also require 
-        # more database testing for sqlite and mysql
-
-        task_keys = list(session.query(
-                        models.TaskInstance.dag_id, 
-                        models.TaskInstance.task_id, 
-                        models.TaskInstance.execution_date
+        ti_query = (session.query(models.TaskInstance)
+                     .filter(models.TaskInstance.state == State.NONE)
                     )
-                    .filter(models.TaskInstance.state == State.NONE))
 
-        self.log.info("Analysing dependencies for %i task instances" % len(task_keys))
+        task_instances = list(ti_query)
+        task_subquery = ti_query.subquery()
 
+        self.log.info("Analysing dependencies for %i task instances" % len(task_instances))
+
+        # Find the state of all previous task instances
+        # This gets a maping in the form
+        #   (dag_id, task_id, execution_date): previous_task_instance_state
+
+        # TODO: This could be filtered by task instances where the task has depends_on_past = True
+        # which would reduce the amount of data loaded from the database
+
+        previous_task_state_map = self._get_previous_task_states(session, task_subquery)
+ 
+        # Find the state of all other task instances in the same dag, for each task 
+        # This returns (dag_id, execution_date) -> {task_id: state, task_id: state, ...} 
+        #   for all tasks in the dag runs in the task instance list
+
+        # TODO: This could be filtered by task instances where there are dependencies on other tasks
+
+        dr_ti_state_map = self._get_related_ti_states(session, task_subquery)
+        
+        # Now process each task instance in turn
+        
         tasks_to_queue = []
+        for ti in task_instances:
 
-        def chunks(list_, n):
-            for i in range(0, len(list_), n):
-                yield list_[i:i + n]
+            dag = self.dags[ti.dag_id]
+            task = dag.get_task(ti.task_id)
 
-        # We chunk by 500 items at a time to avoid sql errors 
+            # Get the previous task instance state and related task instance states for this task
+            try:
+                prev_task_date, prev_task_state = previous_task_state_map[(ti.dag_id, ti.task_id, ti.execution_date)]
+                dag_task_states = dr_ti_state_map[(ti.dag_id, ti.execution_date)]
+            except Exception as e:
+                # We may get an exception here, in two known scenarios:
+                #  - The scheduler was restart whilst a TaskInstance was in the executor queue (certain executors only)
+                #  - Someone deleted a TaskInstance or DagRun from the UI
+                # This may result in the task instance list changing midway through this method
+                # We can skip processing this TaskInstance this run, it should work on the next pass
+                self.log.error("Error querying the state for {} {} {} - state was modified externally".format(ti.dag_id, ti.task_id, ti.execution_date))
+                continue
+                
+            # Nasty hack here. Because one of the possible states for a task instance is None, we cannot use None to 
+            # represent there being no previous task instance
+            if prev_task_date is None:
+                prev_task_state = 'no_previous_task'
 
-        for task_key_slice in chunks(task_keys, 500):
+            (deps_passed, new_state) = self.task_instance_dependency_check(ti, task, prev_task_state, dag_task_states)
 
-            # Find the state of all previous task instances
-            # This gets a maping in the form
-            #   (dag_id, task_id, execution_date): previous_task_instance_state
-
-            # TODO: This could be filtered by task instances where the task has depends_on_past = True
-            # which would reduce the amount of data loaded from the database
-
-            previous_task_state_map = self._get_previous_task_states(session, task_key_slice)
-     
-            # Find the state of all other task instances in the same dag, for each task 
-            # This returns (dag_id, execution_date) -> {task_id: state, task_id: state, ...} 
-            #   for all tasks in the dag runs in the task instance list
-
-            # TODO: This could be filtered by task instances where there are dependencies on other tasks
-
-            dr_ti_state_map = self._get_related_ti_states(session, task_key_slice)
-            
-            # Now process each task instance in turn
-     
-            query_tis = (session.query(models.TaskInstance)
-                            .filter(
-                                tuple_(
-                                    models.TaskInstance.dag_id,
-                                    models.TaskInstance.task_id,
-                                    models.TaskInstance.execution_date
-                                ).in_(task_key_slice)
-                            ))
-
-            for ti in query_tis:
-
-                dag = self.dags[ti.dag_id]
-                task = dag.get_task(ti.task_id)
-
-                # Get the previous task instance state and related task instance states for this task
-                try:
-                    prev_task_date, prev_task_state = previous_task_state_map[(ti.dag_id, ti.task_id, ti.execution_date)]
-                    dag_task_states = dr_ti_state_map[(ti.dag_id, ti.execution_date)]
-                except Exception as e:
-                    # We should not get a keyerror here as we are freezing the list of task keys at the start of this function
-                    self.log.error("Error querying the state for {} {} {} - please report!".format(ti.dag_id, ti.task_id, ti.execution_date))
-                    raise
-                    
-                parent_task_states = set([dag_task_states[parent] for parent in task.upstream_task_ids])
-
-                self.log.debug("Dependency check for {} {} {}".format(ti.dag_id, ti.task_id, ti.execution_date))
-                self.log.debug("Previous task instance: %s -> %s" % (prev_task_date, prev_task_state))
-                self.log.debug("States of other tasks in the same DagRun: %s" % str(dag_task_states))
-
-                # Check if depends_on_past is set, and if the previous task has run yet
-                # If there is no previous task instance, then queue this task. This situation should only be reached
-                # for the very first task instance in a dag
-
-                if task.depends_on_past:
-                    if prev_task_date is not None and prev_task_state == 'failed':
-                        self.log.debug("Setting task %i to state 'upstream_failed' as depends_on_past set true and previous task failed")
-                        ti.state = State.FAILED
-                        continue
-
-                    if prev_task_date is not None and prev_task_state != 'success':
-                        self.log.debug("Leaving task %i in state 'queued' as depends_on_past set true and previous task hasn't executed")
-                        continue
-
-                # Now check dependencies for the tasks in the same DagRun
-                # There are some very odd semanatics here, and it's probably not exactly correct. For example,
-                # when there is a SKIPPED parent task, but the trigger rule is all_success, does that qualify?
-                # Currently trying to match the old semantics for compatability.
-
-                # The definitions in airflow.utils.states.finished does not appear to be correct, so we will
-                # redefine here, rather than changing that file - it will make merging easier for now
-
-                FINAL_STATES = set([State.FAILED, State.SUCCESS, State.SKIPPED, State.UPSTREAM_FAILED])
-
-                if task.trigger_rule == models.TriggerRule.ALL_SUCCESS:
-                    non_success_states = parent_task_states - set([State.SUCCESS])
-                    if non_success_states:
-                        final_non_success_states = parent_task_states & (FINAL_STATES - set([State.SUCCESS]))
-                        if len(final_non_success_states) > 0:
-                            ti.state = State.UPSTREAM_FAILED
-                            self.log.debug("Setting task %s to state 'upstream_failed' as the trigger rule is 'all_success' and there are upstream tasks in a failed state" % ti)
-                            continue
-                        else:
-                            state_str = ','.join(sorted("'%s'" % s for s in non_success_states))
-                            self.log.debug("Leaving task %s in state 'queued' as the trigger rule is 'all_success' but there are tasks in states %s" % (ti, state_str))
-                            continue
-
-                if task.trigger_rule == models.TriggerRule.ALL_FAILED:
-                    non_failure_states = parent_task_states - set([State.FAILURE])
-                    if non_failure_states:
-                        final_non_failure_states = parent_task_states & (FINAL_STATES - set([State.FAILURE]))
-                        if len(final_non_failure_states) > 0:
-                            ti.state = State.SKIPPED
-                            self.log.debug("Setting task %s to state 'skipped' as the trigger rule is 'all_failure' and there are upstream tasks which did not fail" % ti)
-                            continue
-                        else:
-                            state_str = ','.join(sorted("'%s'" % s for s in non_failure_states))
-                            self.log.debug("Leaving task %s in state 'queued' as the trigger rule is 'all_failure' but there are tasks in states %s" % (ti, state_str))
-                            continue
-
-                if task.trigger_rule == models.TriggerRule.ONE_SUCCESS:
-                    if State.SUCCESS not in parent_task_states:
-                        if len(parent_task_states - FINAL_STATES) == 0:
-                            ti.state = State.SKIPPED
-                            self.log.debug("Setting task %s to state 'skipped' as the trigger rule is 'one_success' and all upstream tasks are finished, but no tasks have succeeded" % ti)
-                            continue
-                        else:
-                            self.log.debug("Leaving task %s in state 'queued' as the trigger rule is 'one_success' but no tasks have succeeded" % ti)
-                            continue
-
-                if task.trigger_rule == models.TriggerRule.ONE_FAILED:
-                    if State.FAILURES not in parent_task_states:
-                        if len(parent_task_states - FINAL_STATES) == 0:
-                            ti.state = State.SKIPPED
-                            self.log.debug("Setting task %s to state 'skipped' as the trigger rule is 'one_failure' and all upstream tasks are finished, but no tasks have failed" % ti)
-                            continue
-                        else:
-                            self.log.debug("Leaving task %s in state 'queued' as the trigger rule is 'one_failure' but no tasks have failed" % ti)
-                            continue
-                    
-                # If we reach here then the task is ready to be sent to the executor
-
+            if not deps_passed:
+                if new_state is not None:
+                    ti.state = target_state
+            else:
                 tasks_to_queue.append(ti)
 
-        self.log.info("Dependency checks complete, have %i tasks ready to execute" % len(tasks_to_queue))
+        et_tot = time.time()
+        self.log.info("Dependency checks complete in %.02f seconds, have %i tasks ready to execute" % (et_tot - st_tot, len(tasks_to_queue)))
 
         return tasks_to_queue
     
 
+    def task_instance_dependency_check(self, ti, task, prev_task_state, dag_task_states):
+        """ Run a depdendency check for a single task instance
+
+            ti - The TaskInstance being considered
+            task - The task obtained from DAG.get_task, required for us to introspect the dag structure
+            prev_task_state - An instance of airflow.utils.State, current state of the same task in the previous DagRun 
+                              If no previous DagRun exists, this is set to 'no_previous_task'
+            dag_task_states - A mapping of {task_id: State} for all TaskInstances in the same DagRun
+        
+            Returns - (passed, new_state)
+              passed - boolean, true if task is ready to execute
+              new_state - if passed is False, the state the task should now be set to
+        """
+
+        self.log.debug("Dependency check for {} {} {}".format(ti.dag_id, ti.task_id, ti.execution_date))
+        self.log.debug("Previous task instance state: %s" % (prev_task_state))
+        self.log.debug("States of other tasks in the same DagRun: %s" % str(dag_task_states))
+
+        parent_task_states = set([dag_task_states[parent] for parent in task.upstream_task_ids])
+
+        # Check if depends_on_past is set, and if the previous task has run yet
+        # If there is no previous task instance, then queue this task. This situation should only be reached
+        # for the very first task instance in a dag
+
+        if task.depends_on_past:
+
+            if prev_task_state == 'no_previous_task':
+                self.log.debug("Task has depends_on_past set, but there is no previous DagRun. Allowing task to proceed")
+
+            elif prev_task_state in set([State.SUCCESS, State.SKIPPED]):
+                self.log.debug("Task has depends_on_past set, and previous task is in state '%s'. Allowing task to proceed" % prev_task_state)
+            
+            elif prev_task_state == State.FAILED:
+                self.log.debug("Setting task %i to state 'upstream_failed' as depends_on_past set true and previous task failed")
+                return (False, State.FAILED)
+
+            else:
+                self.log.debug("Leaving task %i in state 'none' as depends_on_past set true and previous task hasn't executed")
+                return (False, None)
+
+
+        # Now check dependencies for the tasks in the same DagRun
+        # There are some very odd semanatics here, and it's probably not exactly correct. For example,
+        # when there is a SKIPPED parent task, but the trigger rule is all_success, does that qualify?
+        # Currently trying to match the old semantics for compatability.
+
+        # The definitions in airflow.utils.states.finished does not appear to be correct, so we will
+        # redefine here, rather than changing that file - it will make merging easier for now
+
+        FINAL_STATES = set([State.FAILED, State.SUCCESS, State.SKIPPED, State.UPSTREAM_FAILED])
+
+        if task.trigger_rule == models.TriggerRule.ALL_SUCCESS:
+            non_success_states = parent_task_states - set([State.SUCCESS])
+            if non_success_states:
+                final_non_success_states = parent_task_states & (FINAL_STATES - set([State.SUCCESS]))
+                if len(final_non_success_states) > 0:
+                    self.log.debug("Setting task %s to state 'upstream_failed' as the trigger rule is 'all_success' and there are upstream tasks in a failed state" % ti)
+                    return (False, State.UPSTREAM_FAILED)
+                else:
+                    state_str = ','.join(sorted("'%s'" % s for s in non_success_states))
+                    self.log.debug("Leaving task %s unqueued as the trigger rule is 'all_success' but there are tasks in states %s" % (ti, state_str))
+                    return (False, None)
+
+        if task.trigger_rule == models.TriggerRule.ALL_FAILED:
+            non_failure_states = parent_task_states - set([State.FAILURE])
+            if non_failure_states:
+                final_non_failure_states = parent_task_states & (FINAL_STATES - set([State.FAILURE]))
+                if len(final_non_failure_states) > 0:
+                    self.log.debug("Setting task %s to state 'skipped' as the trigger rule is 'all_failure' and there are upstream tasks which did not fail" % ti)
+                    return (False, State.SKIPPED)
+                else:
+                    state_str = ','.join(sorted("'%s'" % s for s in non_failure_states))
+                    self.log.debug("Leaving task %s unqueued as the trigger rule is 'all_failure' but there are tasks in states %s" % (ti, state_str))
+                    return (False, None)
+
+        if task.trigger_rule == models.TriggerRule.ONE_SUCCESS:
+            if State.SUCCESS not in parent_task_states:
+                if len(parent_task_states - FINAL_STATES) == 0:
+                    self.log.debug("Setting task %s to state 'skipped' as the trigger rule is 'one_success' and all upstream tasks are finished, but no tasks have succeeded" % ti)
+                    return (False, State.SKIPPED)
+                else:
+                    self.log.debug("Leaving task %s unqueued as the trigger rule is 'one_success' but no tasks have succeeded" % ti)
+                    return (False, None)
+
+        if task.trigger_rule == models.TriggerRule.ONE_FAILED:
+            if State.FAILURES not in parent_task_states:
+                if len(parent_task_states - FINAL_STATES) == 0:
+                    ti.state = State.SKIPPED
+                    self.log.debug("Setting task %s to state 'skipped' as the trigger rule is 'one_failure' and all upstream tasks are finished, but no tasks have failed" % ti)
+                    return (False, State.SKIPPED)
+                else:
+                    self.log.debug("Leaving task %s unqueued as the trigger rule is 'one_failure' but no tasks have failed" % ti)
+                    return (False, None)
+
+        return (True, None)
+        
 
     def build_dagruns_and_tasks(self, session):
 
@@ -470,10 +514,23 @@ class Scheduler(LoggingMixin):
             dr_count = 0
             ti_count = 0
 
+            # To keep track of how many we already have which pass dep check
+            ti_this_dag_ok_count = (
+                sum([1 for (dag_id_, task_id, execution_date) in self.ready_tasks if dag_id_ == dag_id])  
+            )
+
             while next_run_date: 
 
-                if dr_count == self.MAX_CREATE_DAGRUN_PER_LOOP:
+                if dr_count >= self.MAX_CREATE_DAGRUN_PER_LOOP:
                     self.log.debug("Reached DagRun creation limit for this scheduler loop")
+                    break
+
+                if ti_count + ti_this_dag_ok_count >= 1000:
+                    self.log.debug("Reached DagRun creation limit for this dag")
+                    break
+
+                if ti_count + len(self.ready_tasks) >= 1000:
+                    self.log.debug("Reached DagRun creation limit for this dag")
                     break
 
                 # TODO: Find a way to put a lambda around this as if logging is not set to debug we are
@@ -518,7 +575,7 @@ class Scheduler(LoggingMixin):
 
 
 
-    def _get_previous_task_states(self, session, task_keys):
+    def _get_previous_task_states(self, session, task_subquery):
     
         # Build up a mapping from (dag_id, task_id, execution_date) -> (prev_execution_date, previous_state)
         # so we can do the dependency check for the current tasks
@@ -535,28 +592,17 @@ class Scheduler(LoggingMixin):
         #  test_dag  | task-2    | 2018-04-23 00:00:00 | 2018-04-22 00:00:00
         #  test_dag  | task-3    | 2018-04-23 00:00:00 | 2018-04-22 00:00:00
 
-        # Create query to get the task instances in task_keys
-
-        query_tis = (session.query(models.TaskInstance)
-                        .filter(
-                            tuple_(
-                                models.TaskInstance.dag_id, 
-                                models.TaskInstance.task_id, 
-                                models.TaskInstance.execution_date  
-                            ).in_(task_keys)
-                        )).subquery()
-
         # Join the previous table instance
 
         prev_task_instance = aliased(models.TaskInstance)
 
         prev_execution_date = (session.query(func.max(prev_task_instance.execution_date))
-                                .filter(prev_task_instance.execution_date < query_tis.c.execution_date)
-                                .filter(prev_task_instance.task_id == query_tis.c.task_id)
-                                .filter(prev_task_instance.dag_id == query_tis.c.dag_id)
+                                .filter(prev_task_instance.execution_date < task_subquery.c.execution_date)
+                                .filter(prev_task_instance.task_id == task_subquery.c.task_id)
+                                .filter(prev_task_instance.dag_id == task_subquery.c.dag_id)
                                 .label("prev_execution_date"))
 
-        ti_and_prev_tis = session.query(query_tis.c.dag_id, query_tis.c.task_id, query_tis.c.execution_date, prev_execution_date)
+        ti_and_prev_tis = session.query(task_subquery.c.dag_id, task_subquery.c.task_id, task_subquery.c.execution_date, prev_execution_date)
 
         # Now join the previous table back to the TaskInstance table, so we can obtain the state of the 
         # previous TaskInstance
@@ -576,6 +622,8 @@ class Scheduler(LoggingMixin):
 
         # Build up the mapping from (dag_id, task_id, execution_date) -> (prev_execution_date, previous_state)
 
+        # print("Running", query)
+
         previous_task_state_map = {
             (dag_id, task_id, execution_date): (prev_execution_date, previous_state)
             for (dag_id, task_id, execution_date, prev_execution_date, previous_state) in query
@@ -583,29 +631,22 @@ class Scheduler(LoggingMixin):
     
         return previous_task_state_map
 
-    def _get_related_ti_states(self, session, task_keys):
+    def _get_related_ti_states(self, session, task_subquery):
         """ Returns a mapping of (dag_id, execution_date) -> task_id -> state
               eg: ('test_dag', '2018-04-22 00:00:00') : { 'task_1': 'success', 'task_2': 'queued', 'task_3': 'failure'}
 
             For all DagRuns related to the query TaskInstances (query_tis)
         """
 
-        query_tis = (session.query(models.TaskInstance)
-                        .filter(
-                            tuple_(
-                                models.TaskInstance.dag_id,
-                                models.TaskInstance.task_id,
-                                models.TaskInstance.execution_date
-                            ).in_(task_keys)
-                        )).subquery()
-
         ti_states = (session.query(models.TaskInstance.dag_id, models.TaskInstance.task_id, models.TaskInstance.execution_date, models.TaskInstance.state)
             .filter(models.TaskInstance.execution_date == models.DagRun.execution_date)
             .filter(models.TaskInstance.dag_id == models.DagRun.dag_id)
-            .filter(query_tis.c.execution_date == models.DagRun.execution_date)
-            .filter(query_tis.c.dag_id == models.DagRun.dag_id)
+            .filter(task_subquery.c.execution_date == models.DagRun.execution_date)
+            .filter(task_subquery.c.dag_id == models.DagRun.dag_id)
             .distinct())
         
+        # print("Running", ti_states)
+
         dr_ti_state_map = defaultdict(dict)
         for (dag_id, task_id, execution_date, state) in ti_states:
             dr_ti_state_map[(dag_id, execution_date)][task_id] = state

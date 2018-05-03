@@ -132,6 +132,12 @@ def as_flattened_list(iterable):
     """
     return [e for i in iterable for e in i]
 
+def chunks(list_, n):
+    """ 
+    Split a list into chunks of max length n 
+    """
+    for i in range(0, len(list_), n):
+        yield list_[i:i + n]
 
 def chain(*tasks):
     """
