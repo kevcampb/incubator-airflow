@@ -13,17 +13,20 @@ from airflow.utils.log.logging_mixin import LoggingMixin
 from airflow.utils.state import State
 from airflow.utils.helpers import chunks
 from airflow.utils import timezone
-from airflow import executors, settings
+from airflow.settings import Stats
+from airflow import executors, settings, configuration
+from airflow.jobs import LocalTaskJob
 
 from sqlalchemy.orm import aliased, make_transient
 from sqlalchemy.sql.expression import func
 from sqlalchemy import and_, or_, tuple_
 
-TASK_LIMIT = 36824
+
 
 class Scheduler(LoggingMixin):
 
-    MAX_CREATE_DAGRUN_PER_LOOP = 512
+    # Currently added to prevent logspam. Will affect throughput for loadtests though.
+    MIN_LOOP_DURATION = 10
 
     def __init__(self, executor=executors.GetDefaultExecutor()):
 
@@ -32,15 +35,6 @@ class Scheduler(LoggingMixin):
         self.dagbag = None
         self.dags = {}
         self.executor = executor
-
-        # State counts
-    
-        self.active_tasks = set()
-        # We keep a count of the tasks which pass depdendency checks for now
-        # to avoid making too many tasks at once
-        self.ready_tasks = set()
-        self.ready_count = 0
-
         self._shutdown = False
 
     def run(self):
@@ -59,8 +53,10 @@ class Scheduler(LoggingMixin):
         # Start the executor. This will actually run the code for the task instances, either locally
         # or by queueing them through celery
         self.executor.start()
-    
+
         while not self._shutdown:
+
+            st = time.time()
 
             # Reload the dag files from disk if they are modified
             self.reload_dags()
@@ -74,26 +70,19 @@ class Scheduler(LoggingMixin):
             # self.retry_failed_tasks(session)
 
             # If any task is in state running but has exceeded timeout, set state to failed
-            self.fail_timed_out_tasks(session)
+            self.handle_timed_out_tasks(session)
 
             # Run dependency checks. At present this returns back a list of tasks_to_run. As a 
             # side effect updates task state to SKIPPED / UPSTREAM_FAILED
             tasks_to_run = self.run_dependency_checks(session)
 
-            # Store the counts
-            self.ready_tasks = set(
-                [(ti.dag_id, ti.task_id, ti.execution_date) for ti in tasks_to_run]
-            )
-
-            self.ready_count = len(tasks_to_run) + len(self.active_tasks)
-
             # Enqueue tasks to workers, respecting concurrency limits and task dependencies
-            self.queue_tasks_to_workers(session, tasks_to_run)
+            active_task_keys = self.queue_tasks_to_workers(session, tasks_to_run)
 
             # Check to see if we need to create new DagRuns and TaskInstances for Dags which run
             # on a schedule. We do this after the dependency checks so we know how many tasks
-            # are ready to run
-            self.build_dagruns_and_tasks(session)
+            # are ready to run. We only create new dagruns if the dag concurrency is not reached
+            self.build_dagruns_and_tasks(session, active_task_keys)
             
             # Check SLAs and alert if any tasks haven't been completed on time
             self.perform_sla_check(session)
@@ -105,9 +94,14 @@ class Scheduler(LoggingMixin):
             # Flush all state to the database. This will clear any cached database objects, so the 
             # next iteration reloads from the database.
             session.commit()
-    
-            self.log.info("Scheduler loop complete")
-            # time.sleep(0.5)
+
+            et = time.time()
+            self.log.info("Scheduler loop complete in %.02f seconds" % (et - st))
+
+            if et - st < self.MIN_LOOP_DURATION:
+                sleep_time = self.MIN_LOOP_DURATION - (et - st)
+                self.log.info("Sleeping for %.02f seconds" % sleep_time)
+                time.sleep(sleep_time)
 
         self.log.info("Shutting down executor")
         # Wait for executor to exit and shutdown cleanly
@@ -128,14 +122,6 @@ class Scheduler(LoggingMixin):
                 dag_id, task_id, execution_date, state
             )
 
-            if task_key not in self.active_tasks:
-                self.log.warn("We got a executor response for %s %s %s which we didn't seem to have queued" % (dag_id, task_id, execution_date))
-                # This should not happen with local executor! It probably shouldn't happen with celery either
-                # TODO: Leaving this debug line in to see if this happens again
-                from IPython import embed
-                embed()
-            
-            self.active_tasks.remove(task_key)
             dag_runs_to_check.add((dag_id, execution_date))
 
         # Now for all affected dags, we should recheck their status and set the state accordingly
@@ -228,28 +214,160 @@ class Scheduler(LoggingMixin):
         """
         
 
-    def fail_timed_out_tasks(self, session):
+    def handle_timed_out_tasks(self, session):
         # TODO: Implement this
         pass
+
+        self.log.info("Finding 'running' jobs without a recent heartbeat")
+        secs = configuration.conf.getint('scheduler', 'scheduler_zombie_task_threshold')
+
+        limit_dttm = timezone.utcnow() - timedelta(seconds=secs)
+        self.log.info("Failing jobs without heartbeat after %s", limit_dttm)
+
+        tis = (
+            session.query(models.TaskInstance)
+            .join(LocalTaskJob, models.TaskInstance.job_id == LocalTaskJob.id)
+            .filter(models.TaskInstance.state == State.RUNNING)
+            .filter(
+                or_(
+                    LocalTaskJob.state != State.RUNNING,
+                    LocalTaskJob.latest_heartbeat < limit_dttm,
+                ))
+            .all()
+        )
+
+        for ti in tis:
+            dag = self.dags[ti.dag_id]
+            task = dag.get_task(ti.task_id)
+
+            error = "{} killed as zombie".format(str(ti))
+
+            self.log.info('Marked zombie job %s as failed', ti)
+            Stats.incr('zombies_killed')
+
+            ti.task = task
+
+            new_state = self.handle_failed_task(session, ti, error)
+
+            ti.state = new_state
+
+        # Commit to DB now as emails have been sent
+        session.commit()
+
+
+    def handle_failed_task(self, session, ti, error):
+        """ We call this on task when either:
+              The executor replies the task has failed
+              We decide the task is a zombie as there has been no heartbeat
+
+            Returns
+              (new_state, email)
+        """
+
+        ti.end_date = timezone.utcnow()
+        ti.set_duration()
+
+        Stats.incr('operator_failures_{}'.format(ti.task.__class__.__name__), 1, 1)
+        Stats.incr('ti_failures')
+
+        session.add(models.Log(State.FAILED, ti))
+        session.add(models.TaskFail(ti.task, ti.execution_date, ti.start_date, ti.end_date))
+
+        if ti.task.retries and ti.try_number <= ti.max_tries:
+            new_state = State.UP_FOR_RETRY
+            self.log.info('Marking task as UP_FOR_RETRY')
+            if ti.task.email_on_retry and ti.task.email:
+                try:
+                    ti.email_alert(error, is_retry=True)
+                except Exception as e2:
+                    self.log.error('Failed to send email to: %s', ti.task.email)
+                    self.log.exception(e2)
+
+        else:
+            new_state = State.FAILED
+            if ti.task.retries:
+                self.log.info('All retries failed; marking task as FAILED')
+            else:
+                self.log.info('Marking task as FAILED.')
+            if ti.task.email_on_failure and ti.task.email:
+                try:
+                    ti.email_alert(error, is_retry=True)
+                except Exception as e2:
+                    self.log.error('Failed to send email to: %s', ti.task.email)
+                    self.log.exception(e2)
+
+        self.log.error(str(error))
+
+        return new_state
+
 
     def perform_sla_check(self, session):
         # TODO: Implement this
         pass
         
+
+    def get_active_task_keys(self, session):
+        """ Returns a set of (dag_id, task_id, execution_date) for all active tasks """
+
+        res = (session.query(models.TaskInstance.dag_id, models.TaskInstance.task_id, models.TaskInstance.execution_date)
+            .filter(models.TaskInstance.state.in_((State.RUNNING, State.QUEUED)))
+        )
+    
+        return set([
+            (ti.dag_id, ti.task_id, ti.execution_date) for ti in res
+        ])
+
+
     def queue_tasks_to_workers(self, session, tasks_to_run):
+
+        # Count the number of active tasks in the database
+        #
+        # The true value may decrease in the background as we go through this method
+        #   executor will set some tasks from running to success / failed
+        #   current implementation of ShortCircuitOperator 
+        #
+        # If it decreases all that happesn is we queue less task this loop than we'd like, which is fine
+        #
+        # It may also increase with the current implementation of SubDagOperator and TriggerDagRunOperator
+        # but lets ignore this for now. Those tasks will likely end up failing and getting rescheduled.
+        # This is probably what happened in the old scheduler as well anyway, although the race condition
+        # may have been tighter
+
+        # Get a count of active tasks
+        # We want the following structures
+        #   active_dag_runs = {dag_id: set(exection_dates)}
+        #   active_task_instances = {(dag_id, task_id): set(execution_dates)}
+        st = time.time()
+        active_task_keys = self.get_active_task_keys(session)
+
+        active_dag_runs = defaultdict(set)
+        active_task_instances = defaultdict(set)
+        for dag_id, task_id, execution_date in active_task_keys:
+            active_dag_runs[dag_id].add((execution_date))
+            active_task_instances[(dag_id, task_id)].add((execution_date))
+
+        et = time.time()
+        self.log.info("Loaded active task counts in %.02f seconds" % (et - st))
 
         execution_queue = []
 
         for ti in tasks_to_run:
 
-            # Check scheduler concurrency limits
-            # TODO: Implement this properly
-
-            if len(self.active_tasks) >= TASK_LIMIT:
-                self.log.info("Queued %i tasks, will not queue more as there are %i active tasks and the task limit is %i" % (len(execution_queue), len(self.active_tasks), TASK_LIMIT))
-                break
-
             dag = self.dags[ti.dag_id]
+            task = dag.get_task(ti.task_id)
+
+            # Don't queue tasks for paused tasks
+            if dag.is_paused:
+                continue
+
+            # Ensure that we respect the max concurrency for the Dag
+            if len(active_dag_runs[ti.dag_id]) >= dag.concurrency:
+                continue
+
+            # Ensure that we respect the max concurrency for the Task
+            if task.task_concurrency:
+                if len(active_task_instances[(ti.dag_id, ti.task_id)]) >= task.task_concurrency:
+                    continue
 
             command = " ".join(
                 models.TaskInstance.generate_command(
@@ -276,10 +394,14 @@ class Scheduler(LoggingMixin):
             )
 
             ti.state = State.QUEUED
-            
-            task_key = ti.dag_id, ti.task_id, ti.execution_date
-            self.active_tasks.add(task_key)
+            ti.queued_dttm = timezone.utcnow()
+        
+            # Maintain our counts 
+            active_task_keys.add((ti.dag_id, ti.task_id, ti.execution_date))
+            active_dag_runs[ti.dag_id].add(ti.execution_date)
+            active_task_instances[ti.task_id].add(ti.execution_date)
 
+            # Record that we well send this to the executor
             execution_queue.append((ti, command, priority, queue))
 
         # Commit before sending to the executor. We need to do this at present as the worker processes will check and modify
@@ -308,7 +430,12 @@ class Scheduler(LoggingMixin):
                 queue = queue
             )
 
-        self.log.info("Executor now has %i tasks queued" % (len(self.active_tasks)))
+        self.log.info("Executor now has %i tasks queued" % (len(active_task_keys)))
+
+        # Return our active task list. We will use them in the next processing stage and this saves pulling them
+        # from the database again
+
+        return active_task_keys
         
 
     def run_dependency_checks(self, session):
@@ -375,7 +502,7 @@ class Scheduler(LoggingMixin):
 
             if not deps_passed:
                 if new_state is not None:
-                    ti.state = target_state
+                    ti.state = new_state
             else:
                 tasks_to_queue.append(ti)
 
@@ -482,7 +609,11 @@ class Scheduler(LoggingMixin):
         return (True, None)
         
 
-    def build_dagruns_and_tasks(self, session):
+    def build_dagruns_and_tasks(self, session, active_task_keys):
+
+        active_dag_runs = defaultdict(set)
+        for dag_id, task_id, execution_date in active_task_keys:
+            active_dag_runs[dag_id].add((execution_date))
 
         for dag_id in self.dagbag.dags:
 
@@ -510,27 +641,16 @@ class Scheduler(LoggingMixin):
                 last_scheduled_run = None
             )
 
-            # To keep track of how many new objects we create
+            # Count the number of new objects this loop - for debug log purposes only
             dr_count = 0
             ti_count = 0
 
-            # To keep track of how many we already have which pass dep check
-            ti_this_dag_ok_count = (
-                sum([1 for (dag_id_, task_id, execution_date) in self.ready_tasks if dag_id_ == dag_id])  
-            )
-
             while next_run_date: 
 
-                if dr_count >= self.MAX_CREATE_DAGRUN_PER_LOOP:
+                active_dag_run_count = len(active_dag_runs[dag_id])
+
+                if active_dag_run_count >= dag.concurrency:
                     self.log.debug("Reached DagRun creation limit for this scheduler loop")
-                    break
-
-                if ti_count + ti_this_dag_ok_count >= 1000:
-                    self.log.debug("Reached DagRun creation limit for this dag")
-                    break
-
-                if ti_count + len(self.ready_tasks) >= 1000:
-                    self.log.debug("Reached DagRun creation limit for this dag")
                     break
 
                 # TODO: Find a way to put a lambda around this as if logging is not set to debug we are
@@ -548,6 +668,8 @@ class Scheduler(LoggingMixin):
                 dr._state = State.RUNNING
                 session.add(dr)
                 dr_count += 1
+
+                active_dag_runs[dag_id].add(next_run_date)
 
                 # Create the TaskInstances
                 for task in dag.tasks:
