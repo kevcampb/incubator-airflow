@@ -34,6 +34,7 @@ class Scheduler(LoggingMixin):
 
         self.dagbag = None
         self.dags = {}
+        self.dag_paused_status = {}
         self.executor = executor
         self._shutdown = False
 
@@ -61,6 +62,7 @@ class Scheduler(LoggingMixin):
             # Reload the dag files from disk if they are modified
             self.reload_dags()
 
+            # The reload dags method currently invalidates the session, get a new one
             session = settings.Session()
 
             # Check responses from the executor
@@ -135,7 +137,15 @@ class Scheduler(LoggingMixin):
         # We are forced to do this for now, to avoid having to change the dagbag code
         # calling get_dag resets the sqlalchemy session
         for dag_id in self.dagbag.dags:
-            self.dags[dag_id] = self.dagbag.get_dag(dag_id)
+            dag = self.dagbag.get_dag(dag_id)
+            self.dags[dag_id] = dag
+            # This is maddening. The Dag object in the codebase actually does a db query when you read the 
+            # property is_paused. Additionally, it resets the sqlalchemy session. For now as a workaround
+            # we store this value for all dags on reload
+            self.dag_paused_status[dag_id] = dag.is_paused
+            
+    def dag_is_paused(self, dag_id):
+        return self.dag_paused_status[dag_id]
 
     def reset_scheduler(self, session):
         """ Reset the database state when the scheduler is restarted
@@ -357,7 +367,7 @@ class Scheduler(LoggingMixin):
             task = dag.get_task(ti.task_id)
 
             # Don't queue tasks for paused tasks
-            if dag.is_paused:
+            if self.dag_is_paused(ti.dag_id):
                 continue
 
             # Ensure that we respect the max concurrency for the Dag
@@ -447,8 +457,10 @@ class Scheduler(LoggingMixin):
         # additional data for each task instance, on order to carry out dependencies
 
         ti_query = (session.query(models.TaskInstance)
-                     .filter(models.TaskInstance.state == State.NONE)
-                    )
+                     .filter(or_(
+                          models.TaskInstance.state == State.NONE,
+                          models.TaskInstance.state == State.UP_FOR_RETRY
+                   )))
 
         task_instances = list(ti_query)
         task_subquery = ti_query.subquery()
@@ -624,7 +636,7 @@ class Scheduler(LoggingMixin):
                 # which is a bit odd, but we'll leave it for now during this refactor
                 continue
 
-            if dag.is_paused:
+            if self.dag_is_paused(dag_id):
                 self.log.info("Not processing DAG %s since it's paused", dag.dag_id)
                 continue
                 
