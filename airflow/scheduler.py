@@ -139,10 +139,15 @@ class Scheduler(LoggingMixin):
         for dag_id in self.dagbag.dags:
             dag = self.dagbag.get_dag(dag_id)
             self.dags[dag_id] = dag
+
+            # Update the database. 
+            dag.sync_to_db()
+
             # This is maddening. The Dag object in the codebase actually does a db query when you read the 
             # property is_paused. Additionally, it resets the sqlalchemy session. For now as a workaround
             # we store this value for all dags on reload
             self.dag_paused_status[dag_id] = dag.is_paused
+
             
     def dag_is_paused(self, dag_id):
         return self.dag_paused_status[dag_id]
@@ -492,6 +497,10 @@ class Scheduler(LoggingMixin):
             dag = self.dags[ti.dag_id]
             task = dag.get_task(ti.task_id)
 
+            if self.dag_is_paused(ti.dag_id):
+                # Don't do dependency checks on paused dags
+                continue
+
             # Get the previous task instance state and related task instance states for this task
             try:
                 prev_task_date, prev_task_state = previous_task_state_map[(ti.dag_id, ti.task_id, ti.execution_date)]
@@ -542,7 +551,14 @@ class Scheduler(LoggingMixin):
         self.log.debug("Previous task instance state: %s" % (prev_task_state))
         self.log.debug("States of other tasks in the same DagRun: %s" % str(dag_task_states))
 
-        parent_task_states = set([dag_task_states[parent] for parent in task.upstream_task_ids])
+        # Note that it's possible a parent doesn't exist, if a dagrun was modified once the dag was running
+        # In this case, we ignore those task states. The semantics of ALL_SUCCESS, etc still make sense with
+        # missing task instances
+    
+        parent_task_states = set([
+            dag_task_states[parent] for parent in task.upstream_task_ids
+            if parent in dag_task_states
+        ])
 
         # Check if depends_on_past is set, and if the previous task has run yet
         # If there is no previous task instance, then queue this task. This situation should only be reached
