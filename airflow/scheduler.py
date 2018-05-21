@@ -5,6 +5,7 @@
 #
 
 import time
+import pendulum
 from datetime import datetime, timedelta
 from collections import defaultdict
 
@@ -59,10 +60,13 @@ class Scheduler(LoggingMixin):
 
             st = time.time()
 
+            session = settings.Session()
+
             # Reload the dag files from disk if they are modified
-            self.reload_dags()
+            self.reload_dags(session)
 
             # The reload dags method currently invalidates the session, get a new one
+            session.commit()
             session = settings.Session()
 
             # Check responses from the executor
@@ -130,7 +134,7 @@ class Scheduler(LoggingMixin):
         # TODO: implement this
 
 
-    def reload_dags(self):
+    def reload_dags(self, session):
         self.dagbag = models.DagBag()
         self.dags = {}
         
@@ -148,6 +152,66 @@ class Scheduler(LoggingMixin):
             # we store this value for all dags on reload
             self.dag_paused_status[dag_id] = dag.is_paused
 
+        dagbag_dag_task_values = set([])
+        for dag_id, dag in self.dags.items():
+            for task_id in dag.task_ids: 
+                dagbag_dag_task_values.add((dag_id, task_id)) 
+
+        # Check for any TaskInstances which have a dag_run, task_id which is not in the dag list
+        # We will set the state of these to REMOVED for now
+        session = settings.Session()
+
+        dag_task_values = (session.query(models.TaskInstance.dag_id, models.TaskInstance.task_id)
+            .filter(or_(
+                models.TaskInstance.state != State.REMOVED,
+                models.TaskInstance.state == None
+            ))).distinct()
+
+        for (dag_id, task_id) in dag_task_values:
+            if (dag_id, task_id) not in dagbag_dag_task_values:
+
+                tis = (session.query(models.TaskInstance)
+                    .filter(
+                        and_(
+                            models.TaskInstance.dag_id == dag_id,
+                            models.TaskInstance.task_id == task_id,
+                            or_(    
+                                models.TaskInstance.state != State.REMOVED,
+                                models.TaskInstance.state == None
+                            )
+                        )))
+
+                self.log.warn("Task %(dag_id)s %(task_id)s no longer exists in Dag files on disk. Settings %(count)i task instances to state REMOVED" % {
+                    'dag_id': dag_id,
+                    'task_id': task_id,
+                    'count': tis.count(),
+                })
+            
+                tis.update({'state': State.REMOVED})
+
+        # Check for any TaskInstance which was set to REMOVED and check it hasn't been reinstated
+        dag_task_values = (session.query(models.TaskInstance.dag_id, models.TaskInstance.task_id)
+            .filter(models.TaskInstance.state == State.REMOVED)
+        ).distinct()
+
+        for (dag_id, task_id) in dag_task_values:
+            if (dag_id, task_id) in dagbag_dag_task_values:
+
+                tis = (session.query(models.TaskInstance)
+                    .filter(
+                        and_(
+                            models.TaskInstance.dag_id == dag_id,
+                            models.TaskInstance.task_id == task_id,
+                            models.TaskInstance.state == State.REMOVED
+                        )))
+
+                self.log.warn("Task %(dag_id)s %(task_id)s has been restored on disk. Re-activating %(count)i task instances which were in the REMOVED state" % {
+                    'dag_id': dag_id,
+                    'task_id': task_id,
+                    'count': tis.count(),
+                })
+            
+                tis.update({'state': State.NONE})
             
     def dag_is_paused(self, dag_id):
         return self.dag_paused_status[dag_id]
@@ -161,23 +225,29 @@ class Scheduler(LoggingMixin):
 
         LOCAL_EXECUTORS = (
             executors.LocalExecutor, 
+            executors.SequentialExecutor,
 #            executors.Executors.DummyExecutor, 
-            executors.SequentialExecutor
         )
 
         tis = (session.query(models.TaskInstance)
-                .filter(models.TaskInstance.state==State.QUEUED)
-                )
+                .filter(or_(
+                    models.TaskInstance.state == State.SCHEDULED,
+                    models.TaskInstance.state == State.QUEUED,
+                )))
+
+        self.log.info("Resetting state for {} queued task instances due to scheduler restart".format(tis.count()))
+
         tis.update({'state': State.NONE})
 
         tis = (session.query(models.TaskInstance)
-                .filter(models.TaskInstance.state==State.RUNNING)
-                )
+            .filter(models.TaskInstance.state==State.RUNNING)
+        )
     
         if isinstance(self.executor, LOCAL_EXECUTORS):
+            self.log.info("Resetting state for {} running task instances due to scheduler restart".format(tis.count()))
             tis.update({'state': State.NONE})
         else:
-            if tis.count() > 0:
+            if tis.count() > 1:
                 self.log.warn("Tasks are currently in the RUNNING state and you are running a distributed executor. You need to wait for these tasks to time out")
                 time.sleep(2)
 
@@ -230,28 +300,41 @@ class Scheduler(LoggingMixin):
         
 
     def handle_timed_out_tasks(self, session):
-        # TODO: Implement this
-        pass
 
         self.log.info("Finding 'running' jobs without a recent heartbeat")
         secs = configuration.conf.getint('scheduler', 'scheduler_zombie_task_threshold')
 
-        limit_dttm = timezone.utcnow() - timedelta(seconds=secs)
+        now = timezone.utcnow()
+        limit_dttm = now - timedelta(seconds=secs)
         self.log.info("Failing jobs without heartbeat after %s", limit_dttm)
 
         tis = (
-            session.query(models.TaskInstance)
-            .join(LocalTaskJob, models.TaskInstance.job_id == LocalTaskJob.id)
-            .filter(models.TaskInstance.state == State.RUNNING)
+            session.query(models.TaskInstance, LocalTaskJob)
+            .outerjoin(LocalTaskJob, models.TaskInstance.job_id == LocalTaskJob.id)
+            .filter(
+                models.TaskInstance.state == State.RUNNING
+            )
             .filter(
                 or_(
+                    LocalTaskJob.state == None,
                     LocalTaskJob.state != State.RUNNING,
                     LocalTaskJob.latest_heartbeat < limit_dttm,
-                ))
-            .all()
+                )
+            )
         )
 
-        for ti in tis:
+        for ti, ltj in tis:
+
+            if ltj is None:
+                self.log.info("TaskInstance {} {} {} is in state {} but has no matching Job in the database, resetting".format(ti.dag_id, ti.task_id, ti.execution_date, ti.state))
+            elif ltj.state != State.RUNNING:
+                self.log.info("TaskInstance {} {} {} is in state {} but Job is in state {}, resetting".format(ti.dag_id, ti.task_id, ti.execution_date, ti.state, ltj.state))
+            elif ltj.latest_heartbeat < limit_dttm:
+                delta = pendulum.instance(now) - pendulum.instance(ltj.latest_heartbeat)
+                self.log.info("TaskInstance {} {} {} is in state {} but the Job's last heartbeat is {} ago".format(ti.dag_id, ti.task_id, ti.execution_date, ti.state, delta))
+            else:
+                raise LogicError("This condition should not be reached")
+
             dag = self.dags[ti.dag_id]
             task = dag.get_task(ti.task_id)
 
