@@ -441,9 +441,11 @@ class Scheduler(LoggingMixin):
         active_task_keys = self.get_active_task_keys(session)
 
         active_dag_runs = defaultdict(set)
+        active_dag_tasks = defaultdict(set)
         active_task_instances = defaultdict(set)
         for dag_id, task_id, execution_date in active_task_keys:
             active_dag_runs[dag_id].add((execution_date))
+            active_dag_tasks[dag_id].add((task_id, execution_date))
             active_task_instances[(dag_id, task_id)].add((execution_date))
 
         et = time.time()
@@ -461,7 +463,11 @@ class Scheduler(LoggingMixin):
                 continue
 
             # Ensure that we respect the max concurrency for the Dag
-            if len(active_dag_runs[ti.dag_id]) >= dag.concurrency:
+            # Max DagRuns per Dag
+            if len(active_dag_runs[ti.dag_id]) >= dag.max_active_runs:
+                continue
+            # Max TaskInstances per Dag
+            if len(active_dag_tasks[ti.dag_id]) >= dag.concurrency:
                 continue
 
             # Ensure that we respect the max concurrency for the Task
@@ -505,6 +511,7 @@ class Scheduler(LoggingMixin):
         
             # Maintain our counts 
             active_task_keys.add((ti.dag_id, ti.task_id, ti.execution_date))
+            active_dag_tasks[ti.dag_id].add((ti.task_id, ti.execution_date))
             active_dag_runs[ti.dag_id].add(ti.execution_date)
             active_task_instances[ti.task_id].add(ti.execution_date)
 
