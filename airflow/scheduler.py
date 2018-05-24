@@ -310,6 +310,8 @@ class Scheduler(LoggingMixin):
         limit_dttm = now - timedelta(seconds=secs)
         self.log.info("Failing jobs without heartbeat after %s", limit_dttm)
 
+        # Handle RUNNING tasks without heartbeat
+
         tis = (
             session.query(models.TaskInstance, LocalTaskJob)
             .outerjoin(LocalTaskJob, models.TaskInstance.job_id == LocalTaskJob.id)
@@ -350,6 +352,18 @@ class Scheduler(LoggingMixin):
             new_state = self.handle_failed_task(session, ti, error)
 
             ti.state = new_state
+
+        # Handle QUEUED tasks which the executor does not know about
+        
+        tis = (
+            session.query(models.TaskInstance)
+            .filter(models.TaskInstance.state == State.QUEUED)
+        )
+        
+        for ti in tis:
+            if ti.key not in self.executor.queued_tasks and ti.key not in self.executor.running:
+                self.log.info("TaskInstance {} {} {} disappeared after it was sent to the executor, resetting state".format(ti.dag_id, ti.task_id, ti.execution_date))
+                ti.state = State.NONE
 
         # Commit to DB now as emails have been sent
         session.commit()
