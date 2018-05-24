@@ -70,11 +70,7 @@ class Scheduler(LoggingMixin):
             session = settings.Session()
 
             # Check responses from the executor
-            # Note: Moved further down as there is a design issue in task responses. The workers
-            # set state both in the database and send replies via celery. This means that 
-            # run_dependency_checks may consider tasks with UP_FOR_REPLY in the db, when we haven't
-            # processed the celery reply yet!
-            # self.process_executor_replies(session)
+            self.process_executor_replies(session)
 
             # Retry tasks which have failed
             # self.retry_failed_tasks(session)
@@ -85,9 +81,6 @@ class Scheduler(LoggingMixin):
             # Run dependency checks. At present this returns back a list of tasks_to_run. As a 
             # side effect updates task state to SKIPPED / UPSTREAM_FAILED
             tasks_to_run = self.run_dependency_checks(session)
-
-            # Process replies (see note above)
-            self.process_executor_replies(session)
 
             # Enqueue tasks to workers, respecting concurrency limits and task dependencies
             active_task_keys = self.queue_tasks_to_workers(session, tasks_to_run)
@@ -475,6 +468,13 @@ class Scheduler(LoggingMixin):
             if task.task_concurrency:
                 if len(active_task_instances[(ti.dag_id, ti.task_id)]) >= task.task_concurrency:
                     continue
+
+            # Check that the executor does not think it is running the task
+            # There is a design issue where the database state and celery replies are not
+            # in sync. We skip any task instances which may be affected by this, and they
+            # should get picked up on a subsequent scheduler pass
+            if ti.key in self.executor.queued_tasks or ti.key in self.executor.running:            
+                continue
 
             command = " ".join(
                 models.TaskInstance.generate_command(
