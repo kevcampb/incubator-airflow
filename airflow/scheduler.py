@@ -70,7 +70,11 @@ class Scheduler(LoggingMixin):
             session = settings.Session()
 
             # Check responses from the executor
-            self.process_executor_replies(session)
+            # Note: Moved further down as there is a design issue in task responses. The workers
+            # set state both in the database and send replies via celery. This means that 
+            # run_dependency_checks may consider tasks with UP_FOR_REPLY in the db, when we haven't
+            # processed the celery reply yet!
+            # self.process_executor_replies(session)
 
             # Retry tasks which have failed
             # self.retry_failed_tasks(session)
@@ -81,6 +85,9 @@ class Scheduler(LoggingMixin):
             # Run dependency checks. At present this returns back a list of tasks_to_run. As a 
             # side effect updates task state to SKIPPED / UPSTREAM_FAILED
             tasks_to_run = self.run_dependency_checks(session)
+
+            # Process replies (see note above)
+            self.process_executor_replies(session)
 
             # Enqueue tasks to workers, respecting concurrency limits and task dependencies
             active_task_keys = self.queue_tasks_to_workers(session, tasks_to_run)
@@ -250,6 +257,8 @@ class Scheduler(LoggingMixin):
             if tis.count() > 1:
                 self.log.warn("Tasks are currently in the RUNNING state and you are running a distributed executor. You need to wait for these tasks to time out")
                 time.sleep(2)
+            else:
+                self.log.info("No tasks in the RUNNING state on scheduler restart")
 
         # DagRun state is a derived state from whether all tasks are active or not
         #   All task instances are in state SUCCESS -> DagRun is in state SUCCESS
