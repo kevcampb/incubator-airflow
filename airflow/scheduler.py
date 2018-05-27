@@ -69,6 +69,9 @@ class Scheduler(LoggingMixin):
             session.commit()
             session = settings.Session()
 
+            # Check database for anomalies (temporary fix during new scheduler migration)
+            self.check_anomalies(session)
+        
             # Check responses from the executor
             self.process_executor_replies(session)
 
@@ -97,6 +100,9 @@ class Scheduler(LoggingMixin):
             self.log.info("Heartbeating executor")
             self.executor.heartbeat()
 
+            # Finally, check the state of any DagRun objects which are 'RUNNING'
+            self.update_active_dagrun_states(session)
+
             # Flush all state to the database. This will clear any cached database objects, so the 
             # next iteration reloads from the database.
             session.commit()
@@ -116,6 +122,24 @@ class Scheduler(LoggingMixin):
         # Process final replies as tasks may still have been running as we shut down
         self.process_executor_replies(session)
 
+    def check_anomalies(self, session):
+        """ Temporary fixes for a few conditions which may happen on migration
+            to new scheduler. This section should be removed and changed into some 
+            form of database migration, or larger scale fixes of the codebase
+        """
+        # Check for TaskInstances which do not have associated DagRuns
+        tis = (session.query(models.TaskInstance)
+                .outerjoin(models.DagRun, and_(
+                    models.TaskInstance.dag_id == models.DagRun.dag_id,
+                    models.TaskInstance.execution_date == models.DagRun.execution_date,
+                ))
+                .filter(models.DagRun.execution_date == None)
+              )
+        
+        for ti in tis:  
+            self.log.warning("Task Instance {} {} {} has no DagRun, removing".format(ti.dag_id, ti.task_id, ti.execution_date))
+            session.delete(ti)
+        session.commit()
 
     def process_executor_replies(self, session):
         responses = self.executor.get_event_buffer(self.dags.keys())
@@ -253,6 +277,8 @@ class Scheduler(LoggingMixin):
             else:
                 self.log.info("No tasks in the RUNNING state on scheduler restart")
 
+    def update_active_dagrun_states(self, session):
+
         # DagRun state is a derived state from whether all tasks are active or not
         #   All task instances are in state SUCCESS -> DagRun is in state SUCCESS
         #   All task instances are in state FAILURE -> DagRun is in state FAILURE
@@ -277,7 +303,7 @@ class Scheduler(LoggingMixin):
                       dag_id, execution_date, dr_state,
                       SUM(CASE WHEN ti_state = 'success' OR ti_state = 'skipped' THEN 1 ELSE 0 END) AS success_count,
                       SUM(CASE WHEN ti_state = 'failed' OR ti_state = 'upstream_failed' THEN 1 ELSE 0 END) AS failed_count,
-                      COUNT(ti_state) AS total_count
+                      COUNT(dr_state) AS total_count
 
                       FROM (
                         SELECT
@@ -299,6 +325,8 @@ class Scheduler(LoggingMixin):
                     AND dag_run.execution_date = dag_run_derived_states.execution_date
                     AND dr_state != expected_state
         """
+
+        session.execute(QUERY)
         
 
     def handle_timed_out_tasks(self, session):
