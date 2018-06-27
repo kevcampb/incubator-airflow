@@ -69,6 +69,9 @@ class Scheduler(LoggingMixin):
             session.commit()
             session = settings.Session()
 
+            # Check database for anomalies (temporary fix during new scheduler migration)
+            self.check_anomalies(session)
+        
             # Check responses from the executor
             self.process_executor_replies(session)
 
@@ -97,6 +100,9 @@ class Scheduler(LoggingMixin):
             self.log.info("Heartbeating executor")
             self.executor.heartbeat()
 
+            # Finally, check the state of any DagRun objects which are 'RUNNING'
+            self.update_active_dagrun_states(session)
+
             # Flush all state to the database. This will clear any cached database objects, so the 
             # next iteration reloads from the database.
             session.commit()
@@ -116,6 +122,24 @@ class Scheduler(LoggingMixin):
         # Process final replies as tasks may still have been running as we shut down
         self.process_executor_replies(session)
 
+    def check_anomalies(self, session):
+        """ Temporary fixes for a few conditions which may happen on migration
+            to new scheduler. This section should be removed and changed into some 
+            form of database migration, or larger scale fixes of the codebase
+        """
+        # Check for TaskInstances which do not have associated DagRuns
+        tis = (session.query(models.TaskInstance)
+                .outerjoin(models.DagRun, and_(
+                    models.TaskInstance.dag_id == models.DagRun.dag_id,
+                    models.TaskInstance.execution_date == models.DagRun.execution_date,
+                ))
+                .filter(models.DagRun.execution_date == None)
+              )
+        
+        for ti in tis:  
+            self.log.warning("Task Instance {} {} {} has no DagRun, removing".format(ti.dag_id, ti.task_id, ti.execution_date))
+            session.delete(ti)
+        session.commit()
 
     def process_executor_replies(self, session):
         responses = self.executor.get_event_buffer(self.dags.keys())
@@ -250,6 +274,10 @@ class Scheduler(LoggingMixin):
             if tis.count() > 1:
                 self.log.warn("Tasks are currently in the RUNNING state and you are running a distributed executor. You need to wait for these tasks to time out")
                 time.sleep(2)
+            else:
+                self.log.info("No tasks in the RUNNING state on scheduler restart")
+
+    def update_active_dagrun_states(self, session):
 
         # DagRun state is a derived state from whether all tasks are active or not
         #   All task instances are in state SUCCESS -> DagRun is in state SUCCESS
@@ -275,7 +303,7 @@ class Scheduler(LoggingMixin):
                       dag_id, execution_date, dr_state,
                       SUM(CASE WHEN ti_state = 'success' OR ti_state = 'skipped' THEN 1 ELSE 0 END) AS success_count,
                       SUM(CASE WHEN ti_state = 'failed' OR ti_state = 'upstream_failed' THEN 1 ELSE 0 END) AS failed_count,
-                      COUNT(ti_state) AS total_count
+                      COUNT(dr_state) AS total_count
 
                       FROM (
                         SELECT
@@ -297,6 +325,8 @@ class Scheduler(LoggingMixin):
                     AND dag_run.execution_date = dag_run_derived_states.execution_date
                     AND dr_state != expected_state
         """
+
+        session.execute(QUERY)
         
 
     def handle_timed_out_tasks(self, session):
@@ -307,6 +337,8 @@ class Scheduler(LoggingMixin):
         now = timezone.utcnow()
         limit_dttm = now - timedelta(seconds=secs)
         self.log.info("Failing jobs without heartbeat after %s", limit_dttm)
+
+        # Handle RUNNING tasks without heartbeat
 
         tis = (
             session.query(models.TaskInstance, LocalTaskJob)
@@ -348,6 +380,18 @@ class Scheduler(LoggingMixin):
             new_state = self.handle_failed_task(session, ti, error)
 
             ti.state = new_state
+
+        # Handle QUEUED tasks which the executor does not know about
+        
+        tis = (
+            session.query(models.TaskInstance)
+            .filter(models.TaskInstance.state == State.QUEUED)
+        )
+        
+        for ti in tis:
+            if ti.key not in self.executor.queued_tasks and ti.key not in self.executor.running:
+                self.log.info("TaskInstance {} {} {} disappeared after it was sent to the executor, resetting state".format(ti.dag_id, ti.task_id, ti.execution_date))
+                ti.state = State.NONE
 
         # Commit to DB now as emails have been sent
         session.commit()
@@ -404,15 +448,15 @@ class Scheduler(LoggingMixin):
         pass
         
 
-    def get_active_task_keys(self, session):
-        """ Returns a set of (dag_id, task_id, execution_date) for all active tasks """
+    def get_active_task_key_states(self, session):
+        """ Returns a set of (dag_id, task_id, execution_date, state) for all active tasks """
 
-        res = (session.query(models.TaskInstance.dag_id, models.TaskInstance.task_id, models.TaskInstance.execution_date)
+        res = (session.query(models.TaskInstance.dag_id, models.TaskInstance.task_id, models.TaskInstance.execution_date, models.TaskInstance.state)
             .filter(models.TaskInstance.state.in_((State.RUNNING, State.QUEUED)))
         )
     
         return set([
-            (ti.dag_id, ti.task_id, ti.execution_date) for ti in res
+            (ti.dag_id, ti.task_id, ti.execution_date, ti.state) for ti in res
         ])
 
 
@@ -436,13 +480,18 @@ class Scheduler(LoggingMixin):
         #   active_dag_runs = {dag_id: set(exection_dates)}
         #   active_task_instances = {(dag_id, task_id): set(execution_dates)}
         st = time.time()
-        active_task_keys = self.get_active_task_keys(session)
+        active_task_key_states = self.get_active_task_key_states(session)
+
+        self.log.info("Currently %i active TaskInstances according to database" % len(active_task_key_states))
 
         active_dag_runs = defaultdict(set)
+        active_dag_tasks = defaultdict(set)
         active_task_instances = defaultdict(set)
-        for dag_id, task_id, execution_date in active_task_keys:
+        for dag_id, task_id, execution_date, state in active_task_key_states:
             active_dag_runs[dag_id].add((execution_date))
+            active_dag_tasks[dag_id].add((task_id, execution_date))
             active_task_instances[(dag_id, task_id)].add((execution_date))
+            self.log.info("  TaskInstance {} {} {} is in state {}".format(dag_id, task_id, execution_date, state))
 
         et = time.time()
         self.log.info("Loaded active task counts in %.02f seconds" % (et - st))
@@ -459,7 +508,11 @@ class Scheduler(LoggingMixin):
                 continue
 
             # Ensure that we respect the max concurrency for the Dag
-            if len(active_dag_runs[ti.dag_id]) >= dag.concurrency:
+            # Max DagRuns per Dag
+            if len(active_dag_runs[ti.dag_id]) >= dag.max_active_runs:
+                continue
+            # Max TaskInstances per Dag
+            if len(active_dag_tasks[ti.dag_id]) >= dag.concurrency:
                 continue
 
             # Ensure that we respect the max concurrency for the Task
@@ -501,7 +554,8 @@ class Scheduler(LoggingMixin):
             ti.queued_dttm = timezone.utcnow()
         
             # Maintain our counts 
-            active_task_keys.add((ti.dag_id, ti.task_id, ti.execution_date))
+            active_task_key_states.add((ti.dag_id, ti.task_id, ti.execution_date, ti.state))
+            active_dag_tasks[ti.dag_id].add((ti.task_id, ti.execution_date))
             active_dag_runs[ti.dag_id].add(ti.execution_date)
             active_task_instances[ti.task_id].add(ti.execution_date)
 
@@ -534,12 +588,19 @@ class Scheduler(LoggingMixin):
                 queue = queue
             )
 
-        self.log.info("Executor now has %i tasks queued" % (len(active_task_keys)))
+        task_states = [state for (_,_,_,state) in active_task_key_states]
+
+        self.log.info("Executor now has %i queued / %i running TaskInstances" % (
+            sum([state == State.QUEUED for state in task_states]),
+            sum([state == State.RUNNING for state in task_states])
+        ))
 
         # Return our active task list. We will use them in the next processing stage and this saves pulling them
         # from the database again
 
-        return active_task_keys
+        return [ (dag_id, task_id, execution_date) 
+            for (dag_id, task_id, execution_date, state) in active_task_key_states
+        ]
         
 
     def run_dependency_checks(self, session):

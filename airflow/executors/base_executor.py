@@ -53,6 +53,7 @@ class BaseExecutor(LoggingMixin):
             self.log.info("Adding to queue: %s", command)
             self.queued_tasks[key] = (command, priority, queue, task_instance)
         else:
+            raise Exception("Tried to queue an already running task {}". format(key))
             self.log.info("could not queue task {}".format(key))
 
     def queue_task_instance(
@@ -130,8 +131,9 @@ class BaseExecutor(LoggingMixin):
             # Backfill. This fix reduces the probability of a collision but
             # does NOT eliminate it.
             self.queued_tasks.pop(key)
-            ti.refresh_from_db()
-            if ti.state != State.RUNNING:
+            #ti.refresh_from_db()
+            #if ti.state != State.RUNNING:
+            if True:
                 self.running[key] = command
                 self.execute_async(key=key,
                                    command=command,

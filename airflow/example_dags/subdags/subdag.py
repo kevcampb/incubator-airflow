@@ -35,4 +35,11 @@ def subdag(parent_dag_name, child_dag_name, args):
             dag=dag_subdag,
         )
 
+    DummyOperator(
+        task_id='%s-task-fail' % (child_dag_name),
+        default_args=args,
+        dag=dag_subdag,
+        result='failure',
+    )
+
     return dag_subdag

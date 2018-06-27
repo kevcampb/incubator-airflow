@@ -25,7 +25,7 @@ import airflow.utils.helpers
 
 args = {
     'owner': 'airflow',
-    'start_date': airflow.utils.dates.days_ago(2)
+    'start_date': airflow.utils.dates.days_ago(50)
 }
 
 dag = DAG(dag_id='example_short_circuit_operator', default_args=args)

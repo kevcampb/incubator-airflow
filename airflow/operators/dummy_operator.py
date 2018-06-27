@@ -19,7 +19,8 @@
 
 from airflow.models import BaseOperator
 from airflow.utils.decorators import apply_defaults
-
+from airflow.utils.state import State
+from airflow.exceptions import AirflowException
 
 class DummyOperator(BaseOperator):
     """
@@ -31,8 +32,12 @@ class DummyOperator(BaseOperator):
     ui_color = '#e8f7e4'
 
     @apply_defaults
-    def __init__(self, *args, **kwargs):
+    def __init__(self, *args, result=State.SUCCESS, **kwargs):
+        self.result = result
         super(DummyOperator, self).__init__(*args, **kwargs)
 
     def execute(self, context):
-        pass
+        if self.result == State.SUCCESS:
+            pass
+        else:
+            raise AirlowExecption("Simulated Error")
