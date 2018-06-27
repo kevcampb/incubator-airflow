@@ -137,7 +137,7 @@ class TriggerRuleDep(BaseTIDep):
         # bundled together for efficiency.
         # handling instant state assignment based on trigger rules
         if flag_upstream_failed:
-            if tr == TR.ALL_SUCCESS:
+            if tr == TR.ALL_SUCCESS or tr == TR.ALL_SUCCESS_OR_SKIPPED:
                 if upstream_failed or failed:
                     ti.set_state(State.UPSTREAM_FAILED, session)
                 elif skipped:
@@ -172,6 +172,15 @@ class TriggerRuleDep(BaseTIDep):
                 yield self._failing_status(
                     reason="Task's trigger rule '{0}' requires all upstream "
                     "tasks to have succeeded, but found {1} non-success(es). "
+                    "upstream_tasks_state={2}, upstream_task_ids={3}"
+                    .format(tr, num_failures, upstream_tasks_state,
+                            task.upstream_task_ids))
+        elif tr == TR.ALL_SUCCESS_OR_SKIPPED:
+            num_failures = upstream - successes - skipped
+            if num_failures > 0:
+                yield self._failing_status(
+                    reason="Task's trigger rule '{0}' requires all upstream "
+                    "tasks to have succeeded, but found {1} non-success or skipped tasks. "
                     "upstream_tasks_state={2}, upstream_task_ids={3}"
                     .format(tr, num_failures, upstream_tasks_state,
                             task.upstream_task_ids))

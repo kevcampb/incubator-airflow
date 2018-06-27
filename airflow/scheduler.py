@@ -467,6 +467,12 @@ class Scheduler(LoggingMixin):
                 if len(active_task_instances[(ti.dag_id, ti.task_id)]) >= task.task_concurrency:
                     continue
 
+            # Check that the executor does not think it's processing the task
+            # This is possible if a worker sets task state to UP_FOR_RETRY and we haven't
+            # processed the executor replies yet. We'll probably get this task on the next pass
+            if ti.key in self.executor.queued_tasks or ti.key in self.executor.running:
+                continue
+
             command = " ".join(
                 models.TaskInstance.generate_command(
                     ti.dag_id,
@@ -686,10 +692,22 @@ class Scheduler(LoggingMixin):
                     self.log.debug("Leaving task %s unqueued as the trigger rule is 'all_success' but there are tasks in states %s" % (ti, state_str))
                     return (False, None)
 
+        if task.trigger_rule == models.TriggerRule.ALL_SUCCESS_OR_SKIPPED:
+            non_success_states = parent_task_states - set([State.SUCCESS, State.SKIPPED])
+            if non_success_states:
+                final_non_success_states = non_success_states & FINAL_STATES
+                if len(final_non_success_states) > 0:
+                    self.log.debug("Setting task %s to state 'upstream_failed' as the trigger rule is 'all_success_or_skipped' and there are upstream tasks in a failed state" % ti)
+                    return (False, State.UPSTREAM_FAILED)
+                else:
+                    state_str = ','.join(sorted("'%s'" % s for s in non_success_states))
+                    self.log.debug("Leaving task %s unqueued as the trigger rule is 'all_success_or_skipped' but there are tasks in states %s" % (ti, state_str))
+                    return (False, None)
+
         if task.trigger_rule == models.TriggerRule.ALL_FAILED:
             non_failure_states = parent_task_states - set([State.FAILURE])
             if non_failure_states:
-                final_non_failure_states = parent_task_states & (FINAL_STATES - set([State.FAILURE]))
+                final_non_failure_states = non_failure_states & FINAL_STATES 
                 if len(final_non_failure_states) > 0:
                     self.log.debug("Setting task %s to state 'skipped' as the trigger rule is 'all_failure' and there are upstream tasks which did not fail" % ti)
                     return (False, State.SKIPPED)
@@ -716,6 +734,8 @@ class Scheduler(LoggingMixin):
                 else:
                     self.log.debug("Leaving task %s unqueued as the trigger rule is 'one_failure' but no tasks have failed" % ti)
                     return (False, None)
+
+        self.log.debug("Task %s passed depedency check" % ti)
 
         return (True, None)
         
