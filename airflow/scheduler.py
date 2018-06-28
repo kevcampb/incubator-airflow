@@ -647,8 +647,27 @@ class Scheduler(LoggingMixin):
             dag = self.dags[ti.dag_id]
             task = dag.get_task(ti.task_id)
 
+            # Don't do dependency checks on paused dags
+
             if self.dag_is_paused(ti.dag_id):
-                # Don't do dependency checks on paused dags
+                continue
+
+            # SkipOperator hack
+            # The current SkipOperator implementation is bonkers, and needs replaced. The SKIPPED state for
+            # tasks is actually set by the worker. It's possible that since we started run_dependency_checks
+            # the parent task of the current task has been marked as SUCCESS, but we haven't noticed that this
+            # current task instance has been updated to SKIPPED.
+            #
+            # As a workaround for now, we see if any of the parents tasks are in the scheduler queue. If so
+            # we skip processing this task instance and leave it for the next pass.
+
+            parents_active = False
+            for parent_task_id in task.get_flat_relative_ids(upstream=True):
+                key = (ti.dag_id, parent_task_id, ti.execution_date)
+                if key in self.executor.queued_tasks or key in self.executor.running:
+                    parents_active = True
+            if parents_active:
+                self.log.debug("parents for {} {} {} are still active in the scheduler, skipping".format(ti.dag_id, ti.task_id, ti.execution_date))
                 continue
 
             # Get the previous task instance state and related task instance states for this task
