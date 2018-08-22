@@ -557,7 +557,7 @@ class Scheduler(LoggingMixin):
             active_task_key_states.add((ti.dag_id, ti.task_id, ti.execution_date, ti.state))
             active_dag_tasks[ti.dag_id].add((ti.task_id, ti.execution_date))
             active_dag_runs[ti.dag_id].add(ti.execution_date)
-            active_task_instances[ti.task_id].add(ti.execution_date)
+            active_task_instances[(ti.dag_id, ti.task_id)].add(ti.execution_date)
 
             # Record that we well send this to the executor
             execution_queue.append((ti, command, priority, queue))
